@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=DNS
+Comment=Switch the device's DNS servers and flush the DNS cache
+Type=Application
+Exec=cosmic-applet-dns
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;DNS;Resolver;Network;Nameserver;Switch;
+Icon=network-server-symbolic
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-CosmicHoverPopup=Auto
+X-HostWaylandDisplay=true

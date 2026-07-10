@@ -1,0 +1,28 @@
+[package]
+name = "cosmic-applet-dns"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "A COSMIC panel applet that switches the device's DNS servers and flushes the DNS cache."
+
+[[bin]]
+name = "cosmic-applet-dns"
+path = "src/main.rs"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "59bebbdffeb8ed4abd3f2577c099745b9a2f2c37", default-features = false, features = [
+    "applet",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "winit",
+] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+
+[profile.release]
+lto = "thin"
+opt-level = 2
