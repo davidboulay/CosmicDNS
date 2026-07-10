@@ -18,8 +18,14 @@ takes effect immediately.
   - **Server list** — click any saved server to switch to it; the active one
     is checkmarked.
   - **Flush DNS cache** — flush on demand without changing servers (switching
-    already flushes automatically).
+    already flushes automatically). The row confirms with a checkmark when the
+    flush completes.
   - A caption shows which network connection the changes apply to.
+- **Follows your network**: the DNS override sticks to the *main* active
+  network. Unplug the LAN and join Wi-Fi (or hop to another network) and the
+  applet moves your chosen DNS onto the new connection automatically — and
+  cleans the override off the one you left. Reactions are instant (`nmcli
+  monitor`), not polled. Tunnels/VPNs are deliberately exempt.
 - **Settings** (the ⚙ button in the popup header):
   - **Manage the server list** — add entries (a name plus one or more IPv4/IPv6
     addresses, comma-separated), **edit** any entry's name or addresses (✎),
@@ -27,9 +33,10 @@ takes effect immediately.
     seeded with Cloudflare, Google, and Quad9 on first run, and if the device
     already had a custom DNS configured, it's imported as an entry too.
   - **Applet self-update** — shows the current version, checks the latest
-    [GitHub release](https://github.com/davidboulay/CosmicDNS/releases), and can
-    **automatically update the applet** when a new release is out (downloads the
-    prebuilt binary, swaps it in place, and the panel respawns the new version).
+    [GitHub release](https://github.com/davidboulay/CosmicDNS/releases), and
+    **automatically updates the applet** when a new release is out (downloads
+    the prebuilt binary, swaps it in place, and the panel respawns the new
+    version). Auto-update is **on by default**; the toggle in Settings opts out.
 
 ## How it works
 
@@ -47,9 +54,10 @@ Everything goes through the same tools you'd use by hand — no daemon, no root:
 Settings are persisted via `cosmic-config`.
 
 **VPNs:** a full-tunnel VPN (e.g. WireGuard) usually takes over DNS for the
-whole device while connected. The applet detects this and shows a heads-up in
+whole device while connected. The applet detects this and shows a ⚠ warning in
 the popup — your switch is saved on the underlying connection and takes effect
-when the VPN disconnects. (Run `cosmic-applet-dns --status` in a terminal to
+when the VPN disconnects. The network-follow behaviour never migrates the DNS
+override onto a tunnel. (Run `cosmic-applet-dns --status` in a terminal to
 see what the applet sees.)
 
 ## Requirements

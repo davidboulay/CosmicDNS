@@ -26,6 +26,9 @@ pub struct DnsState {
     /// DNS queries right now, so changes here won't take effect until it
     /// disconnects. Holds that link's name.
     pub dns_owner: Option<String>,
+    /// True when the default route itself belongs to a tunnel (full-tunnel
+    /// VPN). DNS overrides are never migrated onto tunnels.
+    pub tunnel: bool,
 }
 
 async fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
@@ -66,21 +69,53 @@ async fn default_route_device() -> Result<String, String> {
     Err("no default route — is the network up?".to_string())
 }
 
-/// The NetworkManager connection profile active on `device`.
-async fn connection_for(device: &str) -> Result<String, String> {
-    let out = run("nmcli", &["-g", "GENERAL.CONNECTION", "device", "show", device]).await?;
-    let name = out.trim();
+/// The NetworkManager connection profile active on `device`, plus whether the
+/// device is a tunnel (wireguard/tun/vpn) rather than a real interface.
+async fn connection_for(device: &str) -> Result<(String, bool), String> {
+    let out = run(
+        "nmcli",
+        &["-g", "GENERAL.CONNECTION,GENERAL.TYPE", "device", "show", device],
+    )
+    .await?;
+    let mut lines = out.lines();
+    let name = lines.next().unwrap_or("").trim().to_string();
+    let dtype = lines.next().unwrap_or("").trim().to_lowercase();
     if name.is_empty() || name == "--" {
         return Err(format!("no NetworkManager connection on {device}"));
     }
+    let tunnel = matches!(dtype.as_str(), "wireguard" | "tun" | "tap" | "vpn" | "ip-tunnel");
     // `-g` escapes separator characters in values.
-    Ok(name.replace("\\:", ":"))
+    Ok((name.replace("\\:", ":"), tunnel))
+}
+
+/// Remove any DNS override from a connection profile *without* touching the
+/// live device — used to clean up the network we just left when the override
+/// moves to a new one (the profile may well be inactive by then).
+pub async fn clear_profile(connection: &str) -> Result<(), String> {
+    run(
+        "nmcli",
+        &[
+            "connection",
+            "modify",
+            connection,
+            "ipv4.dns",
+            "",
+            "ipv4.ignore-auto-dns",
+            "no",
+            "ipv6.dns",
+            "",
+            "ipv6.ignore-auto-dns",
+            "no",
+        ],
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Read the current DNS state of the default-route connection.
 pub async fn status() -> Result<DnsState, String> {
     let device = default_route_device().await?;
-    let connection = connection_for(&device).await?;
+    let (connection, tunnel) = connection_for(&device).await?;
 
     let out = run(
         "nmcli",
@@ -116,6 +151,7 @@ pub async fn status() -> Result<DnsState, String> {
         connection,
         custom,
         dns_owner,
+        tunnel,
     })
 }
 
@@ -179,7 +215,7 @@ pub async fn flush_cache() -> Result<(), String> {
 /// and flush the cache. Returns the resulting state.
 pub async fn apply(servers: &[String]) -> Result<DnsState, String> {
     let device = default_route_device().await?;
-    let connection = connection_for(&device).await?;
+    let (connection, _tunnel) = connection_for(&device).await?;
 
     let (v6, v4): (Vec<&str>, Vec<&str>) = servers
         .iter()
@@ -215,7 +251,7 @@ pub async fn apply(servers: &[String]) -> Result<DnsState, String> {
 /// apply live, and flush the cache. Returns the resulting state.
 pub async fn reset() -> Result<DnsState, String> {
     let device = default_route_device().await?;
-    let connection = connection_for(&device).await?;
+    let (connection, _tunnel) = connection_for(&device).await?;
 
     run(
         "nmcli",

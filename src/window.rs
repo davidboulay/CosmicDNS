@@ -38,6 +38,11 @@ const LAST_CUSTOM_KEY: &str = "last-custom";
 /// Config key marking that we already imported the DNS found on the device at
 /// first run, so deleting that entry doesn't resurrect it forever.
 const IMPORTED_KEY: &str = "imported-initial";
+/// Config key for the user's *intent*: custom DNS on (true) or router default
+/// (false). This is what lets the override follow the machine from one
+/// network to another — the new connection won't have it set yet, so intent
+/// can't be derived from the network itself.
+const CUSTOM_ENABLED_KEY: &str = "custom-enabled";
 /// Config key for the "automatically update the applet" toggle.
 const AUTO_UPDATE_KEY: &str = "auto-update";
 /// The release tag we last auto-installed. Prevents an endless update loop when
@@ -93,6 +98,13 @@ pub struct Window {
     applying: bool,
     /// Set while a manual cache flush runs.
     flushing: bool,
+    /// A manual flush just succeeded — swaps the flush row into a checkmark
+    /// until the next action or the popup reopens.
+    flush_ok: bool,
+    /// The user's intent (persisted): true = keep a custom DNS applied, false
+    /// = router default. Drives re-applying the override when the machine
+    /// moves to another network (LAN → Wi-Fi, …).
+    custom_enabled: bool,
     /// Outcome caption of the last action ("DNS cache flushed", errors, …).
     notice: Option<(bool, String)>, // (is_error, text)
     /// Name of the entry last applied — what the on/off toggle turns back on.
@@ -216,13 +228,25 @@ impl Window {
         })
     }
 
+    /// Persist the user's on/off intent, which network changes re-assert.
+    fn set_custom_enabled(&mut self, on: bool) {
+        self.custom_enabled = on;
+        if let Some(cfg) = &self.config
+            && let Err(e) = cfg.set(CUSTOM_ENABLED_KEY, on)
+        {
+            tracing::warn!("could not persist custom-enabled: {e}");
+        }
+    }
+
     /// Switch the device to `entry` (records it as the toggle's "on" state).
     fn apply_entry(&mut self, index: usize) -> app::Task<Message> {
-        let Some(entry) = self.servers.get(index) else {
+        let Some(entry) = self.servers.get(index).cloned() else {
             return Task::none();
         };
         self.applying = true;
         self.notice = None;
+        self.flush_ok = false;
+        self.set_custom_enabled(true);
         self.last_custom = Some(entry.name.clone());
         if let Some(cfg) = &self.config
             && let Err(e) = cfg.set(LAST_CUSTOM_KEY, entry.name.clone())
@@ -239,6 +263,8 @@ impl Window {
     fn apply_reset(&mut self) -> app::Task<Message> {
         self.applying = true;
         self.notice = None;
+        self.flush_ok = false;
+        self.set_custom_enabled(false);
         cosmic::task::future(async move {
             cosmic::Action::App(Message::Applied(backend::reset().await))
         })
@@ -313,10 +339,16 @@ impl cosmic::Application for Window {
             .as_ref()
             .and_then(|c| c.get::<bool>(IMPORTED_KEY).ok())
             .unwrap_or(false);
+        let custom_enabled = config
+            .as_ref()
+            .and_then(|c| c.get::<bool>(CUSTOM_ENABLED_KEY).ok())
+            .unwrap_or(false);
+        // Keeping itself updated is the applet's default posture; opting out
+        // is the setting.
         let auto_update = config
             .as_ref()
             .and_then(|c| c.get::<bool>(AUTO_UPDATE_KEY).ok())
-            .unwrap_or(false);
+            .unwrap_or(true);
         let last_auto_update = config
             .as_ref()
             .and_then(|c| c.get::<String>(LAST_AUTO_UPDATE_KEY).ok())
@@ -329,6 +361,8 @@ impl cosmic::Application for Window {
             current: None,
             applying: false,
             flushing: false,
+            flush_ok: false,
+            custom_enabled,
             notice: None,
             last_custom,
             imported_initial,
@@ -402,7 +436,46 @@ impl cosmic::Application for Window {
             })
         }
 
-        Subscription::batch([periodic_status(), periodic_release_check()])
+        // React immediately when the network changes (cable pulled, Wi-Fi
+        // joined, VPN up/down…): `nmcli monitor` emits a line per event, and
+        // each one triggers a state re-read — which is also what migrates the
+        // DNS override onto the new main network.
+        fn network_events() -> Subscription<Message> {
+            Subscription::run_with("dns-nmcli-monitor", |_| {
+                stream::channel(4, |mut output: mpsc::Sender<Message>| async move {
+                    use tokio::io::{AsyncBufReadExt, BufReader};
+                    loop {
+                        match tokio::process::Command::new("nmcli")
+                            .arg("monitor")
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            Ok(mut child) => {
+                                if let Some(stdout) = child.stdout.take() {
+                                    let mut lines = BufReader::new(stdout).lines();
+                                    while let Ok(Some(_)) = lines.next_line().await {
+                                        // Let event bursts (a connect emits
+                                        // several) settle into one refresh.
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        if output.send(Message::RefreshStatus).await.is_err() {
+                                            let _ = child.kill().await;
+                                            return;
+                                        }
+                                    }
+                                }
+                                let _ = child.kill().await;
+                            }
+                            Err(e) => tracing::warn!("nmcli monitor unavailable: {e}"),
+                        }
+                        // The monitor exited (NetworkManager restart?) — retry.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                })
+            })
+        }
+
+        Subscription::batch([periodic_status(), network_events(), periodic_release_check()])
     }
 
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
@@ -415,6 +488,9 @@ impl cosmic::Application for Window {
                 } else {
                     let new_id = window::Id::unique();
                     self.popup = Some(new_id);
+                    // A fresh popup starts with fresh action feedback.
+                    self.flush_ok = false;
+                    self.notice = None;
                     let popup_settings = self.core.applet.get_popup_settings(
                         self.core.main_window_id().unwrap(),
                         new_id,
@@ -461,8 +537,53 @@ impl cosmic::Application for Window {
                         self.servers.insert(0, entry);
                         self.save_servers();
                     }
+                    // The pre-existing state is also the initial intent.
+                    self.set_custom_enabled(state.custom.is_some());
                 }
-                self.current = Some(state);
+
+                let prev_connection = self.current.as_ref().map(|s| s.connection.clone());
+                let network_changed =
+                    prev_connection.as_deref().is_some_and(|p| p != state.connection);
+                self.current = Some(state.clone());
+
+                // The main network changed (LAN → Wi-Fi, new SSID, …): make it
+                // carry the user's DNS intent. Tunnels are exempt — a VPN's own
+                // DNS is its business (the popup shows a warning instead).
+                if network_changed && !state.tunnel && !self.applying {
+                    if self.custom_enabled {
+                        let desired = self
+                            .last_custom
+                            .as_deref()
+                            .and_then(|n| self.servers.iter().find(|e| e.name == n))
+                            .map(|e| e.addresses.clone());
+                        if let Some(addresses) = desired
+                            && !state
+                                .custom
+                                .as_ref()
+                                .is_some_and(|c| same_servers(c, &addresses))
+                        {
+                            self.applying = true;
+                            self.notice =
+                                Some((false, format!("Moving DNS to {}…", state.connection)));
+                            return cosmic::task::future(async move {
+                                // Take the override off the network we left so
+                                // it isn't stale if we ever plug back in.
+                                if let Some(prev) = prev_connection
+                                    && let Err(e) = backend::clear_profile(&prev).await
+                                {
+                                    tracing::warn!("could not clear DNS on {prev}: {e}");
+                                }
+                                cosmic::Action::App(Message::Applied(
+                                    backend::apply(&addresses).await,
+                                ))
+                            });
+                        }
+                    } else if state.custom.is_some() {
+                        // Intent is router default, but the network we landed
+                        // on still carries an old override — clear it.
+                        return self.apply_reset();
+                    }
+                }
                 Task::none()
             }
             Message::StatusChecked(Err(e)) => {
@@ -522,6 +643,7 @@ impl cosmic::Application for Window {
                     return Task::none();
                 }
                 self.flushing = true;
+                self.flush_ok = false;
                 self.notice = None;
                 cosmic::task::future(async move {
                     cosmic::Action::App(Message::Flushed(backend::flush_cache().await))
@@ -529,10 +651,14 @@ impl cosmic::Application for Window {
             }
             Message::Flushed(result) => {
                 self.flushing = false;
-                self.notice = Some(match result {
-                    Ok(()) => (false, "DNS cache flushed".to_string()),
-                    Err(e) => (true, e),
-                });
+                match result {
+                    Ok(()) => {
+                        // Shown on the flush row itself (checkmark + label).
+                        self.flush_ok = true;
+                        self.notice = None;
+                    }
+                    Err(e) => self.notice = Some((true, e)),
+                }
                 Task::none()
             }
             Message::ToggleSettings => {
@@ -880,17 +1006,24 @@ impl cosmic::Application for Window {
 
         content = content.push(padded_control(divider::horizontal::default()));
 
-        // Manual cache flush.
-        let flush_label = if self.flushing {
-            "Flushing…"
+        // Manual cache flush, confirming success on the row itself.
+        let (flush_icon, flush_label) = if self.flushing {
+            ("view-refresh-symbolic", "Flushing…")
+        } else if self.flush_ok {
+            ("object-select-symbolic", "DNS cache flushed ✓")
         } else {
-            "Flush DNS cache"
+            ("view-refresh-symbolic", "Flush DNS cache")
+        };
+        let flush_text = if self.flush_ok {
+            text::body(flush_label).class(cosmic::theme::Text::Accent)
+        } else {
+            text::body(flush_label)
         };
         content = content.push(
             menu_button(
                 row![
-                    icon::from_name("view-refresh-symbolic").symbolic(true).size(16),
-                    text::body(flush_label),
+                    icon::from_name(flush_icon).symbolic(true).size(16),
+                    flush_text,
                 ]
                 .spacing(space_s)
                 .align_y(Alignment::Center),
@@ -915,11 +1048,21 @@ impl cosmic::Application for Window {
         // is intercepting DNS so a switch here wouldn't take effect anyway.
         if let Some(state) = &self.current {
             if let Some(owner) = &state.dns_owner {
+                let warn_color = theme::active().cosmic().warning_color();
                 content = content.push(
-                    padded_control(text::caption(format!(
-                        "Heads up: “{owner}” (VPN/tunnel) is answering DNS right now — \
-                         switches apply once it disconnects.",
-                    )))
+                    padded_control(
+                        row![
+                            icon::from_name("dialog-warning-symbolic").symbolic(true).size(16),
+                            text::caption(format!(
+                                "“{owner}” (VPN/tunnel) is answering DNS right now — \
+                                 switches apply once it disconnects.",
+                            ))
+                            .class(cosmic::theme::Text::Color(warn_color.into()))
+                            .width(Length::Fill),
+                        ]
+                        .spacing(space_xxs)
+                        .align_y(Alignment::Center),
+                    )
                     .padding([space_xxs, space_m]),
                 );
             }
