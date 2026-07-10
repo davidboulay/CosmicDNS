@@ -77,8 +77,8 @@ enum ReleaseStatus {
     Error(String),
 }
 
-// Panel badges with the state baked into the colour: orange swap-arrows when a
-// custom DNS is forced, grey house when the router/DHCP default is in use.
+// Panel badges with the state baked into the colour: orange server-stack when a
+// custom DNS is forced, grey one when the router/DHCP default is in use.
 const ICON_CUSTOM_SVG: &[u8] = include_bytes!("../icons/dns-custom.svg");
 const ICON_ROUTER_SVG: &[u8] = include_bytes!("../icons/dns-router.svg");
 
