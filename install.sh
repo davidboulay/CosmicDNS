@@ -96,5 +96,5 @@ Add it to the panel:
   Settings → Desktop → Panel (or Dock) → Add Applet → "DNS"
 
 If it doesn't appear right away, restart the panel:
-  cosmic-panel --replace &
+  pkill cosmic-panel   # cosmic-session restarts it automatically
 EOF
