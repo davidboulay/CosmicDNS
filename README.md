@@ -10,7 +10,7 @@ takes effect immediately.
 
 ## What it does
 
-- **Panel button** shows the current state at a glance: a blue badge when a
+- **Panel button** shows the current state at a glance: an orange badge when a
   custom DNS is forced, a grey badge when the router/DHCP default is in use.
 - **Popup** (click the button):
   - **Custom DNS toggle** — flip it off to return to the router's DNS
@@ -22,7 +22,8 @@ takes effect immediately.
   - A caption shows which network connection the changes apply to.
 - **Settings** (the ⚙ button in the popup header):
   - **Manage the server list** — add entries (a name plus one or more IPv4/IPv6
-    addresses, comma-separated) and remove ones you don't want. The list is
+    addresses, comma-separated), **edit** any entry's name or addresses (✎),
+    remove ones you don't want, and **drag rows to reorder** the list. It is
     seeded with Cloudflare, Google, and Quad9 on first run, and if the device
     already had a custom DNS configured, it's imported as an entry too.
   - **Applet self-update** — shows the current version, checks the latest

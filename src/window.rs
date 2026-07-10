@@ -16,8 +16,8 @@ use cosmic::{
     },
     theme,
     widget::{
-        Id, autosize, button, container, divider, icon, scrollable, settings, text, text_input,
-        toggler,
+        Id, autosize, button, container, divider, icon, mouse_area, scrollable, settings, text,
+        text_input, toggler,
     },
 };
 
@@ -77,7 +77,7 @@ enum ReleaseStatus {
     Error(String),
 }
 
-// Panel badges with the state baked into the colour: blue swap-arrows when a
+// Panel badges with the state baked into the colour: orange swap-arrows when a
 // custom DNS is forced, grey house when the router/DHCP default is in use.
 const ICON_CUSTOM_SVG: &[u8] = include_bytes!("../icons/dns-custom.svg");
 const ICON_ROUTER_SVG: &[u8] = include_bytes!("../icons/dns-router.svg");
@@ -103,9 +103,15 @@ pub struct Window {
     config: Option<cosmic_config::Config>,
     /// True while the settings panel is showing instead of the server list.
     show_settings: bool,
-    /// Settings form fields for adding a new entry.
+    /// Settings form fields for adding a new entry — or, when `editing` is
+    /// set, for modifying that existing one.
     edit_name: String,
     edit_addresses: String,
+    /// Index of the entry loaded into the form for editing.
+    editing: Option<usize>,
+    /// Index of the entry currently being drag-reordered (follows the row as
+    /// it moves — the list is reordered live while the mouse is held down).
+    dragging: Option<usize>,
     /// Whether to auto-install newer releases of the applet itself.
     auto_update: bool,
     /// Latest-release status for the applet's own version.
@@ -138,8 +144,18 @@ pub enum Message {
     ToggleSettings,
     EditName(String),
     EditAddresses(String),
+    /// Create a new entry from the form — or save it over the entry being
+    /// edited when one is loaded.
     AddEntry,
     RemoveEntry(usize),
+    /// Load an existing entry into the form for editing.
+    EditEntry(usize),
+    CancelEdit,
+    /// Drag-reorder: press on a row, live-move while hovering others, commit
+    /// on release (or when the pointer leaves the list).
+    DragStart(usize),
+    DragOver(usize),
+    DragEnd,
     /// Check GitHub for a newer release of the applet.
     CheckRelease,
     ReleaseChecked(Result<String, String>),
@@ -320,6 +336,8 @@ impl cosmic::Application for Window {
             show_settings: false,
             edit_name: String::new(),
             edit_addresses: String::new(),
+            editing: None,
+            dragging: None,
             auto_update,
             release: ReleaseStatus::Unknown,
             self_updating: false,
@@ -519,6 +537,13 @@ impl cosmic::Application for Window {
             }
             Message::ToggleSettings => {
                 self.show_settings = !self.show_settings;
+                if !self.show_settings {
+                    // Leaving the panel abandons any in-progress edit/drag.
+                    self.editing = None;
+                    self.dragging = None;
+                    self.edit_name.clear();
+                    self.edit_addresses.clear();
+                }
                 // Refresh the release status when opening the panel.
                 if self.show_settings && !matches!(self.release, ReleaseStatus::Checking) {
                     self.release = ReleaseStatus::Checking;
@@ -539,10 +564,31 @@ impl cosmic::Application for Window {
                 let Some(addresses) = parse_addresses(&self.edit_addresses) else {
                     return Task::none();
                 };
-                if name.is_empty() || self.servers.iter().any(|e| e.name == name) {
+                let duplicate = self
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .any(|(i, e)| e.name == name && self.editing != Some(i));
+                if name.is_empty() || duplicate {
                     return Task::none();
                 }
-                self.servers.push(DnsEntry { name, addresses });
+                match self.editing.take() {
+                    // Save over the entry loaded for editing.
+                    Some(i) if i < self.servers.len() => {
+                        // A rename must follow through to what the on/off
+                        // toggle re-applies.
+                        if self.last_custom.as_deref() == Some(self.servers[i].name.as_str()) {
+                            self.last_custom = Some(name.clone());
+                            if let Some(cfg) = &self.config
+                                && let Err(e) = cfg.set(LAST_CUSTOM_KEY, name.clone())
+                            {
+                                tracing::warn!("could not persist last-custom: {e}");
+                            }
+                        }
+                        self.servers[i] = DnsEntry { name, addresses };
+                    }
+                    _ => self.servers.push(DnsEntry { name, addresses }),
+                }
                 self.save_servers();
                 self.edit_name.clear();
                 self.edit_addresses.clear();
@@ -554,6 +600,66 @@ impl cosmic::Application for Window {
                     if self.last_custom.as_deref() == Some(removed.name.as_str()) {
                         self.last_custom = None;
                     }
+                    match self.editing {
+                        Some(e) if e == i => {
+                            self.editing = None;
+                            self.edit_name.clear();
+                            self.edit_addresses.clear();
+                        }
+                        Some(e) if e > i => self.editing = Some(e - 1),
+                        _ => {}
+                    }
+                    self.dragging = None;
+                    self.save_servers();
+                }
+                Task::none()
+            }
+            Message::EditEntry(i) => {
+                if let Some(entry) = self.servers.get(i) {
+                    self.editing = Some(i);
+                    self.edit_name = entry.name.clone();
+                    self.edit_addresses = entry.addresses.join(", ");
+                }
+                Task::none()
+            }
+            Message::CancelEdit => {
+                self.editing = None;
+                self.edit_name.clear();
+                self.edit_addresses.clear();
+                Task::none()
+            }
+            Message::DragStart(i) => {
+                if i < self.servers.len() {
+                    self.dragging = Some(i);
+                }
+                Task::none()
+            }
+            Message::DragOver(to) => {
+                if let Some(from) = self.dragging
+                    && from != to
+                    && from < self.servers.len()
+                    && to < self.servers.len()
+                {
+                    let entry = self.servers.remove(from);
+                    self.servers.insert(to, entry);
+                    // Keep the edit form pointed at the same entry.
+                    if let Some(e) = self.editing {
+                        self.editing = Some(if e == from {
+                            to
+                        } else if from < e && e <= to {
+                            e - 1
+                        } else if to <= e && e < from {
+                            e + 1
+                        } else {
+                            e
+                        });
+                    }
+                    self.dragging = Some(to);
+                }
+                Task::none()
+            }
+            Message::DragEnd => {
+                if self.dragging.take().is_some() {
                     self.save_servers();
                 }
                 Task::none()
@@ -862,26 +968,49 @@ impl Window {
             .align_y(Alignment::Center),
         );
 
-        // --- Saved servers ---
-        let mut list = column![].spacing(space_xxs);
+        // --- Saved servers (drag a row by its handle/background to reorder;
+        // press on the edit/trash buttons is captured by them, so it doesn't
+        // start a drag) ---
+        let mut rows = column![].spacing(2);
         for (i, entry) in self.servers.iter().enumerate() {
-            list = list.push(
-                row![
-                    column![
-                        text::body(entry.name.clone()),
-                        text::caption(entry.addresses.join(", ")),
-                    ]
-                    .spacing(0)
-                    .width(Length::Fill),
-                    button::icon(icon::from_name("user-trash-symbolic").symbolic(true))
-                        .on_press(Message::RemoveEntry(i)),
+            let content = row![
+                icon::from_name("list-drag-handle-symbolic").symbolic(true).size(16),
+                column![
+                    text::body(entry.name.clone()),
+                    text::caption(entry.addresses.join(", ")),
                 ]
-                .spacing(space_s)
-                .align_y(Alignment::Center),
+                .spacing(0)
+                .width(Length::Fill),
+                button::icon(icon::from_name("document-edit-symbolic").symbolic(true))
+                    .on_press(Message::EditEntry(i)),
+                button::icon(icon::from_name("user-trash-symbolic").symbolic(true))
+                    .on_press(Message::RemoveEntry(i)),
+            ]
+            .spacing(space_s)
+            .align_y(Alignment::Center);
+            // Lift the row visually while it's being dragged.
+            let styled = container(content).padding([space_xxs, space_xxs]).class(
+                if self.dragging == Some(i) {
+                    cosmic::theme::Container::Card
+                } else {
+                    cosmic::theme::Container::Transparent
+                },
+            );
+            rows = rows.push(
+                mouse_area(styled)
+                    .on_press(Message::DragStart(i))
+                    .on_enter(Message::DragOver(i))
+                    .on_release(Message::DragEnd),
             );
         }
+        // Commit the new order when the button is released anywhere over the
+        // list (including between rows) or the pointer leaves it mid-drag.
+        let list = mouse_area(rows)
+            .on_release(Message::DragEnd)
+            .on_exit(Message::DragEnd);
 
-        // --- Add a server ---
+        // --- Add a server / edit the selected one (same form) ---
+        let editing_name = self.editing.and_then(|i| self.servers.get(i)).map(|e| &e.name);
         let name_input = text_input("Name (e.g. Pi-hole)", &self.edit_name)
             .on_input(Message::EditName)
             .width(Length::Fill);
@@ -890,11 +1019,29 @@ impl Window {
             .width(Length::Fill);
         let name = self.edit_name.trim();
         let can_add = !name.is_empty()
-            && !self.servers.iter().any(|e| e.name == name)
+            && !self
+                .servers
+                .iter()
+                .enumerate()
+                .any(|(i, e)| e.name == name && self.editing != Some(i))
             && parse_addresses(&self.edit_addresses).is_some();
-        let add_button = button::suggested("Add server")
-            .on_press_maybe(can_add.then_some(Message::AddEntry))
-            .width(Length::Fill);
+        let mut form_buttons = row![
+            button::suggested(if self.editing.is_some() { "Save changes" } else { "Add server" })
+                .on_press_maybe(can_add.then_some(Message::AddEntry))
+                .width(Length::Fill),
+        ]
+        .spacing(space_s);
+        if self.editing.is_some() {
+            form_buttons = form_buttons.push(
+                button::standard("Cancel")
+                    .on_press(Message::CancelEdit)
+                    .width(Length::Fill),
+            );
+        }
+        let form_heading = match editing_name {
+            Some(n) => format!("Edit “{n}”"),
+            None => "Add a server".to_string(),
+        };
 
         // --- Applet self-update ---
         let version_row = settings::item("Version", text::body(updater::CURRENT_VERSION));
@@ -947,14 +1094,15 @@ impl Window {
             header,
             padded_control(text::heading("DNS servers")),
             padded_control(text::caption(
-                "The list you can switch between from the panel. Changes apply \
-                 to the connection with the default route.",
+                "The list you can switch between from the panel — drag rows to \
+                 reorder. Changes apply to the connection with the default route.",
             ))
             .padding([0, space_m]),
             padded_control(list),
+            padded_control(text::heading(form_heading)),
             padded_control(name_input),
             padded_control(addr_input),
-            padded_control(add_button),
+            padded_control(form_buttons),
             padded_control(divider::horizontal::default()),
             padded_control(text::heading("Applet")),
             padded_control(text::caption(
