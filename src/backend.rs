@@ -318,3 +318,36 @@ pub async fn reset() -> Result<DnsState, String> {
     }
     status().await
 }
+
+#[cfg(test)]
+mod live_tests {
+    //! Round-trips the real default-route connection through DNS over TLS.
+    //! Changes the machine's DNS for a few seconds, so it is `#[ignore]`d:
+    //! run with `cargo test --release -- --ignored --nocapture live_dot_roundtrip`.
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_dot_roundtrip() {
+        let before = status().await.expect("status");
+        println!("before: {before:#?}");
+        let original = before.custom.clone();
+
+        let quad9: Vec<String> = ["9.9.9.9#dns.quad9.net", "149.112.112.112#dns.quad9.net"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let dot = apply(&quad9, true).await.expect("apply DoT");
+        println!("after DoT: {dot:#?}");
+        assert!(dot.dns_over_tls, "connection.dns-over-tls must read back as yes");
+        assert_eq!(dot.custom.as_deref(), Some(&quad9[..]));
+
+        let restored = match original {
+            Some(servers) => apply(&servers, before.dns_over_tls).await.expect("re-apply original"),
+            None => reset().await.expect("reset"),
+        };
+        println!("restored: {restored:#?}");
+        assert_eq!(restored.custom, before.custom);
+        assert_eq!(restored.dns_over_tls, before.dns_over_tls);
+    }
+}
