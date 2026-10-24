@@ -8,6 +8,10 @@ your Pi-hole/AdGuard, or any server you save — and one click back to the
 router's default. Every switch also **flushes the DNS cache**, so the change
 takes effect immediately.
 
+<p align="center">
+  <img src="screenshots/popup.png" width="386" alt="CosmicDNS popup — Custom DNS toggle, saved server list with Cloudflare active, and Flush DNS cache">
+</p>
+
 ## What it does
 
 - **Panel button** shows the current state at a glance: an orange badge when a
