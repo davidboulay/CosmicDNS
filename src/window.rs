@@ -54,7 +54,35 @@ const LAST_AUTO_UPDATE_KEY: &str = "last-auto-update";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DnsEntry {
     pub name: String,
+    /// IP literals, optionally with a TLS server name after `#`
+    /// (`45.90.28.0#abc123.dns.nextdns.io`).
     pub addresses: Vec<String>,
+    /// Reach the servers over DNS over TLS (systemd-resolved, strict mode).
+    /// `default` keeps entries saved by older versions loading.
+    #[serde(default)]
+    pub dns_over_tls: bool,
+}
+
+/// Build the entry for a NextDNS profile: its anycast servers with the
+/// profile ID as the TLS server name, over DoT, so the profile's settings
+/// (blocklists, logs, …) apply. IPv4 and IPv6 both listed, as on the NextDNS
+/// setup page.
+fn nextdns_entry(profile_id: &str) -> DnsEntry {
+    let sni = format!("{profile_id}.dns.nextdns.io");
+    DnsEntry {
+        name: format!("NextDNS ({profile_id})"),
+        addresses: ["45.90.28.0", "45.90.30.0", "2a07:a8c0::", "2a07:a8c1::"]
+            .iter()
+            .map(|ip| format!("{ip}#{sni}"))
+            .collect(),
+        dns_over_tls: true,
+    }
+}
+
+/// A NextDNS profile ID as shown on my.nextdns.io: six hex characters.
+fn parse_nextdns_id(input: &str) -> Option<String> {
+    let id = input.trim().to_ascii_lowercase();
+    (id.len() == 6 && id.chars().all(|c| c.is_ascii_hexdigit())).then_some(id)
 }
 
 /// Sensible starting points; the user can delete any of them in Settings.
@@ -62,6 +90,7 @@ fn preset_entries() -> Vec<DnsEntry> {
     let entry = |name: &str, addrs: &[&str]| DnsEntry {
         name: name.to_string(),
         addresses: addrs.iter().map(|s| s.to_string()).collect(),
+        dns_over_tls: false,
     };
     vec![
         entry("Cloudflare", &["1.1.1.1", "1.0.0.1"]),
@@ -119,6 +148,10 @@ pub struct Window {
     /// set, for modifying that existing one.
     edit_name: String,
     edit_addresses: String,
+    /// "DNS over TLS" toggle of the form.
+    edit_dot: bool,
+    /// NextDNS profile ID typed into the quick-add field.
+    edit_nextdns: String,
     /// Index of the entry loaded into the form for editing.
     editing: Option<usize>,
     /// Index of the entry currently being drag-reordered (follows the row as
@@ -156,6 +189,10 @@ pub enum Message {
     ToggleSettings,
     EditName(String),
     EditAddresses(String),
+    EditDot(bool),
+    EditNextDns(String),
+    /// Add a NextDNS entry (DoT, profile ID from the quick-add field).
+    AddNextDns,
     /// Create a new entry from the form — or save it over the entry being
     /// edited when one is loaded.
     AddEntry,
@@ -178,6 +215,16 @@ pub enum Message {
     SelfUpdated(String, Result<std::path::PathBuf, String>),
 }
 
+/// Second line of an entry row: its servers, tagged when they go over TLS.
+fn entry_caption(entry: &DnsEntry) -> String {
+    let servers = entry.addresses.join(", ");
+    if entry.dns_over_tls {
+        format!("{servers}  ·  DNS over TLS")
+    } else {
+        servers
+    }
+}
+
 /// Order-insensitive comparison of two server lists, so "1.1.1.1, 1.0.0.1"
 /// still matches its entry if NetworkManager reports the pair reversed.
 fn same_servers(a: &[String], b: &[String]) -> bool {
@@ -191,8 +238,31 @@ fn same_servers(a: &[String], b: &[String]) -> bool {
     a == b
 }
 
-/// Parse the free-form addresses field: comma/space separated IPv4/IPv6
-/// literals. Returns None if anything in it isn't an IP address.
+/// One server: an IP literal, optionally followed by `#` and a TLS server
+/// name (`9.9.9.9#dns.quad9.net`) — the syntax systemd-resolved and
+/// NetworkManager use for DNS over TLS.
+fn valid_server(s: &str) -> bool {
+    let (ip, sni) = match s.split_once('#') {
+        Some((ip, sni)) => (ip, Some(sni)),
+        None => (s, None),
+    };
+    if ip.parse::<std::net::IpAddr>().is_err() {
+        return false;
+    }
+    match sni {
+        None => true,
+        Some(host) => {
+            !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        }
+    }
+}
+
+/// Parse the free-form addresses field: comma/space separated servers (see
+/// [`valid_server`]). Returns None if anything in it isn't one.
 fn parse_addresses(input: &str) -> Option<Vec<String>> {
     let addrs: Vec<String> = input
         .split([',', ' ', ';'])
@@ -200,7 +270,7 @@ fn parse_addresses(input: &str) -> Option<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    if addrs.is_empty() || !addrs.iter().all(|a| a.parse::<std::net::IpAddr>().is_ok()) {
+    if addrs.is_empty() || !addrs.iter().all(|a| valid_server(a)) {
         return None;
     }
     Some(addrs)
@@ -254,8 +324,9 @@ impl Window {
             tracing::warn!("could not persist last-custom: {e}");
         }
         let addresses = entry.addresses.clone();
+        let dot = entry.dns_over_tls;
         cosmic::task::future(async move {
-            cosmic::Action::App(Message::Applied(backend::apply(&addresses).await))
+            cosmic::Action::App(Message::Applied(backend::apply(&addresses, dot).await))
         })
     }
 
@@ -370,6 +441,8 @@ impl cosmic::Application for Window {
             show_settings: false,
             edit_name: String::new(),
             edit_addresses: String::new(),
+            edit_dot: false,
+            edit_nextdns: String::new(),
             editing: None,
             dragging: None,
             auto_update,
@@ -532,6 +605,7 @@ impl cosmic::Application for Window {
                         let entry = DnsEntry {
                             name: format!("Imported ({})", custom.join(", ")),
                             addresses: custom.clone(),
+                            dns_over_tls: state.dns_over_tls,
                         };
                         self.last_custom = Some(entry.name.clone());
                         self.servers.insert(0, entry);
@@ -555,8 +629,8 @@ impl cosmic::Application for Window {
                             .last_custom
                             .as_deref()
                             .and_then(|n| self.servers.iter().find(|e| e.name == n))
-                            .map(|e| e.addresses.clone());
-                        if let Some(addresses) = desired
+                            .map(|e| (e.addresses.clone(), e.dns_over_tls));
+                        if let Some((addresses, dot)) = desired
                             && !state
                                 .custom
                                 .as_ref()
@@ -574,7 +648,7 @@ impl cosmic::Application for Window {
                                     tracing::warn!("could not clear DNS on {prev}: {e}");
                                 }
                                 cosmic::Action::App(Message::Applied(
-                                    backend::apply(&addresses).await,
+                                    backend::apply(&addresses, dot).await,
                                 ))
                             });
                         }
@@ -669,6 +743,8 @@ impl cosmic::Application for Window {
                     self.dragging = None;
                     self.edit_name.clear();
                     self.edit_addresses.clear();
+                    self.edit_dot = false;
+                    self.edit_nextdns.clear();
                 }
                 // Refresh the release status when opening the panel.
                 if self.show_settings && !matches!(self.release, ReleaseStatus::Checking) {
@@ -682,7 +758,33 @@ impl cosmic::Application for Window {
                 Task::none()
             }
             Message::EditAddresses(s) => {
+                // A `#servername` only makes sense over TLS: switch it on.
+                if s.contains('#') {
+                    self.edit_dot = true;
+                }
                 self.edit_addresses = s;
+                Task::none()
+            }
+            Message::EditDot(on) => {
+                self.edit_dot = on;
+                Task::none()
+            }
+            Message::EditNextDns(s) => {
+                self.edit_nextdns = s;
+                Task::none()
+            }
+            Message::AddNextDns => {
+                let Some(id) = parse_nextdns_id(&self.edit_nextdns) else {
+                    return Task::none();
+                };
+                let entry = nextdns_entry(&id);
+                if self.servers.iter().any(|e| e.name == entry.name) {
+                    self.notice = Some((true, format!("{} is already in the list", entry.name)));
+                    return Task::none();
+                }
+                self.servers.push(entry);
+                self.save_servers();
+                self.edit_nextdns.clear();
                 Task::none()
             }
             Message::AddEntry => {
@@ -711,13 +813,14 @@ impl cosmic::Application for Window {
                                 tracing::warn!("could not persist last-custom: {e}");
                             }
                         }
-                        self.servers[i] = DnsEntry { name, addresses };
+                        self.servers[i] = DnsEntry { name, addresses, dns_over_tls: self.edit_dot };
                     }
-                    _ => self.servers.push(DnsEntry { name, addresses }),
+                    _ => self.servers.push(DnsEntry { name, addresses, dns_over_tls: self.edit_dot }),
                 }
                 self.save_servers();
                 self.edit_name.clear();
                 self.edit_addresses.clear();
+                self.edit_dot = false;
                 Task::none()
             }
             Message::RemoveEntry(i) => {
@@ -745,6 +848,7 @@ impl cosmic::Application for Window {
                     self.editing = Some(i);
                     self.edit_name = entry.name.clone();
                     self.edit_addresses = entry.addresses.join(", ");
+                    self.edit_dot = entry.dns_over_tls;
                 }
                 Task::none()
             }
@@ -752,6 +856,7 @@ impl cosmic::Application for Window {
                 self.editing = None;
                 self.edit_name.clear();
                 self.edit_addresses.clear();
+                self.edit_dot = false;
                 Task::none()
             }
             Message::DragStart(i) => {
@@ -982,7 +1087,7 @@ impl cosmic::Application for Window {
                 let mut item = row![
                     column![
                         text::body(entry.name.clone()),
-                        text::caption(entry.addresses.join(", ")),
+                        text::caption(entry_caption(entry)),
                     ]
                     .spacing(0)
                     .width(Length::Fill),
@@ -1120,7 +1225,7 @@ impl Window {
                 icon::from_name("list-drag-handle-symbolic").symbolic(true).size(16),
                 column![
                     text::body(entry.name.clone()),
-                    text::caption(entry.addresses.join(", ")),
+                    text::caption(entry_caption(entry)),
                 ]
                 .spacing(0)
                 .width(Length::Fill),
@@ -1157,9 +1262,26 @@ impl Window {
         let name_input = text_input("Name (e.g. Pi-hole)", &self.edit_name)
             .on_input(Message::EditName)
             .width(Length::Fill);
-        let addr_input = text_input("Addresses (e.g. 1.1.1.1, 1.0.0.1)", &self.edit_addresses)
-            .on_input(Message::EditAddresses)
+        let addr_input = text_input(
+            "Addresses (e.g. 1.1.1.1, 1.0.0.1 — or 9.9.9.9#dns.quad9.net for DoT)",
+            &self.edit_addresses,
+        )
+        .on_input(Message::EditAddresses)
+        .width(Length::Fill);
+        let dot_row = settings::item(
+            "DNS over TLS",
+            toggler(self.edit_dot).on_toggle(Message::EditDot),
+        );
+
+        // --- NextDNS quick add: profile ID -> DoT entry with the right SNI ---
+        let nextdns_input = text_input("NextDNS profile ID (e.g. abc123)", &self.edit_nextdns)
+            .on_input(Message::EditNextDns)
             .width(Length::Fill);
+        let nextdns_button = button::standard("Add NextDNS")
+            .on_press_maybe(parse_nextdns_id(&self.edit_nextdns).map(|_| Message::AddNextDns));
+        let nextdns_row = row![nextdns_input, nextdns_button]
+            .spacing(space_s)
+            .align_y(Alignment::Center);
         let name = self.edit_name.trim();
         let can_add = !name.is_empty()
             && !self
@@ -1245,7 +1367,15 @@ impl Window {
             padded_control(text::heading(form_heading)),
             padded_control(name_input),
             padded_control(addr_input),
+            padded_control(dot_row),
             padded_control(form_buttons),
+            padded_control(text::heading("NextDNS")),
+            padded_control(text::caption(
+                "Enter the profile ID from my.nextdns.io: the entry uses NextDNS's \
+                 servers over DNS over TLS with your profile as the server name.",
+            ))
+            .padding([0, space_m]),
+            padded_control(nextdns_row),
             padded_control(divider::horizontal::default()),
             padded_control(text::heading("Applet")),
             padded_control(text::caption(
@@ -1270,5 +1400,59 @@ impl Window {
                 .max_height(560.0),
             )
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_ips_and_dot_servers_are_accepted() {
+        assert_eq!(
+            parse_addresses("1.1.1.1, 1.0.0.1").as_deref(),
+            Some(&["1.1.1.1".to_string(), "1.0.0.1".to_string()][..])
+        );
+        assert!(parse_addresses("9.9.9.9#dns.quad9.net 2620:fe::fe#dns.quad9.net").is_some());
+        assert!(parse_addresses("45.90.28.0#abc123.dns.nextdns.io").is_some());
+    }
+
+    #[test]
+    fn garbage_is_rejected() {
+        assert!(parse_addresses("").is_none());
+        assert!(parse_addresses("dns.quad9.net").is_none(), "a bare hostname is not a server");
+        assert!(parse_addresses("9.9.9.9#").is_none(), "empty server name");
+        assert!(parse_addresses("9.9.9.9#bad name").is_none());
+        assert!(parse_addresses("1.1.1.1, nope").is_none());
+    }
+
+    #[test]
+    fn nextdns_ids_are_six_hex_chars() {
+        assert_eq!(parse_nextdns_id(" ABC123 ").as_deref(), Some("abc123"));
+        assert!(parse_nextdns_id("abc12").is_none());
+        assert!(parse_nextdns_id("abc12g").is_none());
+        assert!(parse_nextdns_id("").is_none());
+    }
+
+    #[test]
+    fn nextdns_entry_carries_the_profile_as_sni_over_dot() {
+        let e = nextdns_entry("abc123");
+        assert_eq!(e.name, "NextDNS (abc123)");
+        assert!(e.dns_over_tls);
+        assert_eq!(e.addresses.len(), 4);
+        assert!(e.addresses.iter().all(|a| a.ends_with("#abc123.dns.nextdns.io")));
+        assert!(e.addresses.iter().all(|a| valid_server(a)));
+        assert_eq!(
+            e.addresses.iter().filter(|a| a.starts_with("2a07:")).count(),
+            2,
+            "two IPv6 servers"
+        );
+    }
+
+    #[test]
+    fn old_saved_entries_without_the_dot_field_still_load() {
+        let e: DnsEntry = serde_json::from_str(r#"{"name":"Pi-hole","addresses":["10.0.0.2"]}"#)
+            .expect("entry saved by v0.3 must deserialize");
+        assert!(!e.dns_over_tls);
     }
 }

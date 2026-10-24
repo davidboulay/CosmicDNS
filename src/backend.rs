@@ -29,6 +29,27 @@ pub struct DnsState {
     /// True when the default route itself belongs to a tunnel (full-tunnel
     /// VPN). DNS overrides are never migrated onto tunnels.
     pub tunnel: bool,
+    /// True when the connection forces DNS over TLS (`connection.dns-over-tls
+    /// yes`), which systemd-resolved then uses for the servers above.
+    pub dns_over_tls: bool,
+}
+
+/// NetworkManager property that makes systemd-resolved talk DNS over TLS to
+/// the connection's servers. NM 1.34+; on older NM it does not exist, which
+/// is why it is only ever written on its own, best-effort, when resetting.
+const DOT_PROPERTY: &str = "connection.dns-over-tls";
+
+/// Reset the connection's DNS-over-TLS flag to NetworkManager's default.
+/// Best-effort: an NM too old to know the property just leaves it unset.
+async fn clear_dot(connection: &str) {
+    if let Err(e) = run(
+        "nmcli",
+        &["connection", "modify", connection, DOT_PROPERTY, "default"],
+    )
+    .await
+    {
+        tracing::debug!("could not reset {DOT_PROPERTY} on {connection}: {e}");
+    }
 }
 
 async fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
@@ -108,8 +129,9 @@ pub async fn clear_profile(connection: &str) -> Result<(), String> {
             "no",
         ],
     )
-    .await
-    .map(|_| ())
+    .await?;
+    clear_dot(connection).await;
+    Ok(())
 }
 
 /// Read the current DNS state of the default-route connection.
@@ -121,7 +143,7 @@ pub async fn status() -> Result<DnsState, String> {
         "nmcli",
         &[
             "-g",
-            "ipv4.dns,ipv4.ignore-auto-dns,ipv6.dns,ipv6.ignore-auto-dns",
+            "ipv4.dns,ipv4.ignore-auto-dns,ipv6.dns,ipv6.ignore-auto-dns,connection.dns-over-tls",
             "connection",
             "show",
             &connection,
@@ -133,6 +155,9 @@ pub async fn status() -> Result<DnsState, String> {
     let v4_ignore = lines.next().unwrap_or("").trim() == "yes";
     let v6_dns = lines.next().unwrap_or("").trim().replace("\\:", ":");
     let v6_ignore = lines.next().unwrap_or("").trim() == "yes";
+    // `-g` prints the enum numerically: -1 default, 0 no, 1 opportunistic,
+    // 2 yes (older nmcli spell it out).
+    let dns_over_tls = matches!(lines.next().unwrap_or("").trim(), "2" | "yes");
 
     let mut servers: Vec<String> = Vec::new();
     for list in [v4_dns, v6_dns] {
@@ -152,6 +177,7 @@ pub async fn status() -> Result<DnsState, String> {
         custom,
         dns_owner,
         tunnel,
+        dns_over_tls,
     })
 }
 
@@ -213,32 +239,46 @@ pub async fn flush_cache() -> Result<(), String> {
 /// Force `servers` as the connection's DNS (IPv4 and IPv6 sorted into their
 /// respective settings), suppress the router-advertised servers, apply live,
 /// and flush the cache. Returns the resulting state.
-pub async fn apply(servers: &[String]) -> Result<DnsState, String> {
+///
+/// A server may carry a TLS server name after `#` (`45.90.28.0#abc123.dns.nextdns.io`,
+/// systemd-resolved's syntax, accepted verbatim by NetworkManager); with
+/// `dns_over_tls` the connection is also switched to strict DNS over TLS, which
+/// is how a NextDNS profile (or any DoT resolver) is reached.
+pub async fn apply(servers: &[String], dns_over_tls: bool) -> Result<DnsState, String> {
     let device = default_route_device().await?;
     let (connection, _tunnel) = connection_for(&device).await?;
 
+    // The SNI part has no colons, so an address is IPv6 iff its IP part has one.
     let (v6, v4): (Vec<&str>, Vec<&str>) = servers
         .iter()
         .map(String::as_str)
-        .partition(|s| s.contains(':'));
+        .partition(|s| s.split('#').next().unwrap_or(s).contains(':'));
 
-    run(
-        "nmcli",
-        &[
-            "connection",
-            "modify",
-            &connection,
-            "ipv4.dns",
-            &v4.join(","),
-            "ipv4.ignore-auto-dns",
-            "yes",
-            "ipv6.dns",
-            &v6.join(","),
-            "ipv6.ignore-auto-dns",
-            "yes",
-        ],
-    )
-    .await?;
+    let v4 = v4.join(",");
+    let v6 = v6.join(",");
+    let mut args = vec![
+        "connection",
+        "modify",
+        connection.as_str(),
+        "ipv4.dns",
+        v4.as_str(),
+        "ipv4.ignore-auto-dns",
+        "yes",
+        "ipv6.dns",
+        v6.as_str(),
+        "ipv6.ignore-auto-dns",
+        "yes",
+    ];
+    if dns_over_tls {
+        // Part of the main modify on purpose: if NM is too old for the
+        // property the switch must fail loudly rather than silently send the
+        // queries in the clear to a server that expects TLS.
+        args.extend([DOT_PROPERTY, "yes"]);
+    }
+    run("nmcli", &args).await?;
+    if !dns_over_tls {
+        clear_dot(&connection).await;
+    }
 
     reapply(&device, &connection).await?;
     if let Err(e) = flush_cache().await {
@@ -270,6 +310,7 @@ pub async fn reset() -> Result<DnsState, String> {
         ],
     )
     .await?;
+    clear_dot(&connection).await;
 
     reapply(&device, &connection).await?;
     if let Err(e) = flush_cache().await {

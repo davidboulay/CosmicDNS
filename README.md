@@ -32,6 +32,16 @@ takes effect immediately.
     remove ones you don't want, and **drag rows to reorder** the list. It is
     seeded with Cloudflare, Google, and Quad9 on first run, and if the device
     already had a custom DNS configured, it's imported as an entry too.
+  - **DNS over TLS** — an entry can be marked *DNS over TLS*; its servers may
+    carry the TLS server name after `#` (`9.9.9.9#dns.quad9.net`), the same
+    syntax systemd-resolved and NetworkManager use. Queries then go to those
+    servers over TLS (strict mode) instead of plain UDP.
+  - **NextDNS** — type your profile ID (from my.nextdns.io) and press
+    *Add NextDNS*: the entry uses NextDNS's servers over DNS over TLS with
+    `<id>.dns.nextdns.io` as the server name, so your profile's settings
+    apply. (DNS over HTTPS/QUIC are not available through NetworkManager /
+    systemd-resolved; if you run the NextDNS CLI locally instead, add
+    `127.0.0.1` as a plain entry.)
   - **Applet self-update** — shows the current version, checks the latest
     [GitHub release](https://github.com/davidboulay/CosmicDNS/releases), and
     **automatically updates the applet** when a new release is out (downloads
@@ -48,6 +58,9 @@ Everything goes through the same tools you'd use by hand — no daemon, no root:
   change lands without dropping the link.
 - **Switching off** clears those overrides so DHCP/the router's DNS is used
   again.
+- **DNS over TLS** entries additionally set `connection.dns-over-tls yes`
+  (NetworkManager 1.34+), which systemd-resolved honours per link; switching
+  away resets it to the default.
 - **Cache flush** uses systemd-resolved (`resolvectl flush-caches`) and runs
   after every switch, plus on demand from the popup.
 
